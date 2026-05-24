@@ -12,24 +12,28 @@ ACTION_ALL_IN = 7
 class AggressiveAgent(BaseAgent):
     """
     激進型 Agent。
-
-    策略特性：
-    - 高頻率 bet/raise，施加最大 fold equity
-    - Reward shaping 獎勵 raise 行為，懲罰 passive check/call
-    - 傾向 overbet 和 all-in 以製造壓力
+    策略特性：高頻率 bet/raise，施加最大 fold equity。
+    Reward shaping 用 pot 比例，避免被 chip 數量淹沒。
     """
 
     def __init__(self, obs_size: int, action_size: int, **kwargs):
         super().__init__(obs_size, action_size, **kwargs)
-        self.aggression_bonus = 0.15
-        self.passive_penalty = -0.05
 
-    def compute_reward_shaping(self, action: int, obs: np.ndarray, base_reward: float) -> float:
+    def compute_reward_shaping(
+        self, action: int, obs: np.ndarray, base_reward: float
+    ) -> float:
+        # pot_ratio: obs[104] = pot / (stack_size * 2)，還原 pot 估算
+        pot_ratio = float(np.clip(obs[104], 0, 1))
+        pot_est = pot_ratio * 2  # 相對單位，0~2
+
         shaping = base_reward
         if action in (ACTION_RAISE_MIN, ACTION_RAISE_POT, ACTION_RAISE_OVERBET, ACTION_ALL_IN):
-            shaping += self.aggression_bonus
+            # 依 pot 大小給予加成：pot 越大，aggressive raise 越有價值
+            shaping += 0.1 * pot_est
         elif action == ACTION_CHECK_CALL:
-            shaping += self.passive_penalty
+            # passive call 輕微懲罰
+            shaping -= 0.05 * pot_est
         elif action == ACTION_FOLD:
-            shaping -= 0.1
+            # fold 懲罰（鼓勵施壓而非逃跑）
+            shaping -= 0.1 * pot_est
         return shaping
