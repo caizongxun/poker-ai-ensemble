@@ -25,30 +25,43 @@ def load_agents(checkpoint_dir, obs_size, action_size):
         path = os.path.join(checkpoint_dir, f"{name}_final.pt")
         if os.path.exists(path):
             agent.load(path)
-            print(f"Loaded {name} from {path}")
+            print(f"  Loaded {name}")
         else:
-            print(f"Warning: {path} not found, using random weights for {name}")
+            print(f"  WARNING: {path} not found, using random weights")
     return agents
 
 
 def run_battle(env, agent_a, agent_b, episodes=1000):
+    """
+    agent_a = player 0, agent_b = player 1。
+    根據 env.state.current_player 路由行動。
+    """
     records = []
     for _ in range(episodes):
         obs = env.reset()
-        episode = {"obs": [], "actions": [], "rewards": [], "agent_ids": []}
+        episode = {"obs": [], "actions": [], "rewards_a": [], "rewards_b": [],
+                   "current_players": []}
         done = False
-        turn = 0
+        last_player = 0
         while not done:
-            current_agent = agent_a if turn % 2 == 0 else agent_b
+            current = env.state.current_player
             legal = env.get_legal_actions()
-            action, logp, value = current_agent.select_action(obs, legal)
+            if current == 0:
+                action, _, _ = agent_a.select_action(obs, legal)
+            else:
+                action, _, _ = agent_b.select_action(obs, legal)
+            last_player = current
             next_obs, reward, done, _ = env.step(action)
             episode["obs"].append(obs.tolist())
             episode["actions"].append(action)
-            episode["rewards"].append(float(reward))
-            episode["agent_ids"].append(turn % 2)
+            episode["current_players"].append(current)
+            if done:
+                episode["rewards_a"].append(float(env.state.get_reward(0)))
+                episode["rewards_b"].append(float(env.state.get_reward(1)))
+            else:
+                episode["rewards_a"].append(0.0)
+                episode["rewards_b"].append(0.0)
             obs = next_obs
-            turn += 1
         records.append(episode)
     return records
 
@@ -59,6 +72,7 @@ def generate(checkpoint_dir, output_path, episodes_per_pair):
     agents = load_agents(checkpoint_dir, env.observation_size, env.action_size)
     names = list(agents.keys())
     all_records = []
+    # 包含 self-play (a vs a) 和 cross-play (a vs b)
     pairs = [(a, b) for i, a in enumerate(names) for b in names[i:]]
     for a_name, b_name in tqdm(pairs, desc="Battle pairs"):
         records = run_battle(env, agents[a_name], agents[b_name], episodes_per_pair)
@@ -66,10 +80,12 @@ def generate(checkpoint_dir, output_path, episodes_per_pair):
             r["agent_a"] = a_name
             r["agent_b"] = b_name
         all_records.extend(records)
-        print(f"  {a_name} vs {b_name}: {len(records)} episodes")
+        # 简單統計輸出
+        wins_a = sum(1 for r in records if r["rewards_a"][-1] > 0)
+        print(f"  {a_name} vs {b_name}: {wins_a}/{len(records)} wins for {a_name}")
     with open(output_path, "wb") as f:
         pickle.dump(all_records, f)
-    print(f"Saved {len(all_records)} battle records to {output_path}")
+    print(f"\nSaved {len(all_records)} battle records to {output_path}")
 
 
 if __name__ == "__main__":

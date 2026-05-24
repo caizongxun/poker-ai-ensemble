@@ -1,5 +1,6 @@
 import argparse
 import os
+import random
 import sys
 import numpy as np
 import torch
@@ -21,21 +22,42 @@ AGENT_MAP = {
 }
 
 
-def collect_rollout(env, agent, num_steps=2048):
+def collect_selfplay_rollout(env, agent, num_steps=2048):
+    """
+    Self-play rollout: agent 同時扑演 player 0 和 player 1。
+    每個 step 根據 env.state.current_player 路由。
+    只收集 agent 主動行動的那一步，不收集對手步驟。
+    """
     obs_buf, act_buf, rew_buf, logp_buf, val_buf, done_buf = [], [], [], [], [], []
     obs = env.reset()
-    for _ in range(num_steps):
+    # 随機指定此局 agent 扇演哪個位置 (0 或 1)，讓訓練更均勻
+    agent_seat = random.randint(0, 1)
+    step = 0
+    while step < num_steps:
+        current = env.state.current_player
         legal = env.get_legal_actions()
         action, logp, value = agent.select_action(obs, legal)
         next_obs, reward, done, _ = env.step(action)
-        shaped_reward = agent.compute_reward_shaping(action, obs, reward)
-        obs_buf.append(obs)
-        act_buf.append(action)
-        rew_buf.append(shaped_reward)
-        logp_buf.append(logp)
-        val_buf.append(value)
-        done_buf.append(done)
-        obs = next_obs if not done else env.reset()
+        if current == agent_seat:
+            # 只收集 agent 自己那一側的資料
+            obs_buf.append(obs)
+            act_buf.append(action)
+            logp_buf.append(logp)
+            val_buf.append(value)
+            if done:
+                final_reward = env.state.get_reward(agent_seat)
+                shaped = agent.compute_reward_shaping(action, obs, final_reward)
+                rew_buf.append(shaped)
+                done_buf.append(True)
+            else:
+                rew_buf.append(0.0)
+                done_buf.append(False)
+            step += 1
+        if done:
+            obs = env.reset()
+            agent_seat = random.randint(0, 1)
+        else:
+            obs = next_obs
     return (
         np.array(obs_buf, dtype=np.float32),
         np.array(act_buf),
@@ -47,7 +69,6 @@ def collect_rollout(env, agent, num_steps=2048):
 
 
 def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    """Generalized Advantage Estimation."""
     n = len(rewards)
     advantages = np.zeros(n, dtype=np.float32)
     last_gae = 0.0
@@ -92,16 +113,16 @@ def train(agent_name: str, episodes: int, save_dir: str):
     env = PokerEnv(num_players=2)
     AgentClass = AGENT_MAP[agent_name]
     agent = AgentClass(env.observation_size, env.action_size)
-    print(f"Training {agent_name} agent for {episodes} steps...")
+    print(f"Training {agent_name} agent for {episodes} steps (self-play)...")
     total_steps = 0
     pbar = tqdm(total=episodes)
     while total_steps < episodes:
-        obs, acts, rews, logps, vals, dones = collect_rollout(env, agent)
+        obs, acts, rews, logps, vals, dones = collect_selfplay_rollout(env, agent)
         advs, rets = compute_gae(rews, vals, dones)
         ppo_update(agent, obs, acts, logps, advs, rets)
         total_steps += len(obs)
         pbar.update(len(obs))
-        if total_steps % 10000 == 0:
+        if total_steps % 50000 == 0:
             agent.save(os.path.join(save_dir, f"{agent_name}_{total_steps}.pt"))
     pbar.close()
     agent.save(os.path.join(save_dir, f"{agent_name}_final.pt"))
