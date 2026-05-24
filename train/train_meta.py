@@ -34,15 +34,10 @@ def load_sub_agents(checkpoint_dir, obs_size, action_size):
 
 
 def pretrain_gating(meta, battle_data_path, epochs=5):
-    """
-    從 battle logs 預訓練 gating network。
-    讓 gating 學習：哪種局面下哪個 expert 贏得比較多。
-    """
+    """從 battle logs 預訓練 gating network。"""
     with open(battle_data_path, "rb") as f:
         records = pickle.load(f)
-
     agent_idx = {"aggressive": 0, "conservative": 1, "strategic": 2, "deceptive": 3}
-
     for epoch in range(epochs):
         total_loss = 0
         count = 0
@@ -50,19 +45,14 @@ def pretrain_gating(meta, battle_data_path, epochs=5):
             if not rec["obs"]:
                 continue
             obs_t = torch.FloatTensor(rec["obs"])
-
-            # 用 rewards_a 判斷 agent_a 是否贏
             final_rew_a = rec["rewards_a"][-1] if rec["rewards_a"] else 0.0
             winner_name = rec["agent_a"] if final_rew_a > 0 else rec["agent_b"]
             best_expert = agent_idx.get(winner_name, 0)
-
             target = torch.zeros(len(obs_t), dtype=torch.long).fill_(best_expert)
             weights = meta.gating(obs_t)
             loss = torch.nn.functional.cross_entropy(weights, target)
-            # 加 entropy regularization 防止 collapse
             entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
             total = loss - 0.1 * entropy
-
             meta.optimizer.zero_grad()
             total.backward()
             torch.nn.utils.clip_grad_norm_(meta.gating.parameters(), 0.5)
@@ -72,31 +62,53 @@ def pretrain_gating(meta, battle_data_path, epochs=5):
         print(f"  Pretrain epoch {epoch+1}/{epochs}, loss: {total_loss/max(count,1):.4f}")
 
 
-def ppo_meta_update(meta, obs, actions, old_logps, rewards, values,
-                    gamma=0.99, clip_eps=0.2):
+def ppo_meta_update(meta, sub_agents, expert_names, obs_list, actions, old_logps,
+                    rewards, values, gamma=0.99, clip_eps=0.2):
+    """
+    PPO update for Meta Agent.
+    actions: poker actions (0-7), NOT expert indices.
+    log_prob 由 mixed poker-action distribution 計算。
+    """
     n = len(rewards)
     if n < 2:
         return
+    # 計算 discounted returns
     returns = np.zeros(n, dtype=np.float32)
     running = 0.0
     for t in reversed(range(n)):
         running = rewards[t] + gamma * running
         returns[t] = running
+
     returns_t = torch.FloatTensor(returns)
-    obs_t = torch.FloatTensor(np.array(obs, dtype=np.float32))
-    act_t = torch.LongTensor(actions)
+    obs_t = torch.FloatTensor(np.array(obs_list, dtype=np.float32))
+    act_t = torch.LongTensor(actions)          # poker actions 0-7
     old_logp_t = torch.FloatTensor(old_logps)
     adv_t = returns_t - torch.FloatTensor(values)
     adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
+    # gating weights: [N, 4]
     weights = meta.gating(obs_t)
-    # entropy regularization
-    entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
-    dist = torch.distributions.Categorical(probs=weights)
+    gating_entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
+
+    # 建立 mixed poker-action distribution: [N, 8]
+    all_expert_probs = []
+    for name in expert_names:
+        agent = sub_agents[name]
+        probs_list = []
+        for ob in obs_list:
+            p = agent.get_action_probs(ob, list(range(meta.action_size)))
+            probs_list.append(p)
+        all_expert_probs.append(torch.FloatTensor(np.array(probs_list)))  # [N, 8]
+    expert_stack = torch.stack(all_expert_probs, dim=1)  # [N, 4, 8]
+    mixed_probs = (weights.unsqueeze(2) * expert_stack).sum(dim=1)  # [N, 8]
+    mixed_probs = mixed_probs.clamp(min=1e-8)
+    mixed_probs = mixed_probs / mixed_probs.sum(dim=-1, keepdim=True)
+
+    dist = torch.distributions.Categorical(probs=mixed_probs)  # support: 0-7
     new_logp = dist.log_prob(act_t)
     ratio = (new_logp - old_logp_t).exp()
     surr = torch.min(ratio * adv_t, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv_t)
-    loss = -surr.mean() - 0.05 * entropy
+    loss = -surr.mean() - 0.05 * gating_entropy
 
     meta.optimizer.zero_grad()
     loss.backward()
@@ -114,11 +126,13 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
         sub_agents=sub_agents,
         mode="soft",
     )
+    expert_names = MetaAgent.EXPERT_NAMES
+
     if os.path.exists(battle_data_path):
         print("Pre-training gating network from battle logs...")
         pretrain_gating(meta, battle_data_path, epochs=5)
     else:
-        print(f"WARNING: battle data not found at {battle_data_path}, skipping pretrain")
+        print(f"WARNING: {battle_data_path} not found, skipping pretrain")
 
     print(f"Fine-tuning Meta Agent for {episodes} episodes...")
     total_steps = 0
@@ -132,35 +146,27 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
         while not done:
             current = env.state.current_player
             legal = env.get_legal_actions()
-
             if current == 0:
-                # meta 控制 player 0
-                action, logp, value, weights = meta.select_action(obs, legal)
+                action, logp, value, _ = meta.select_action(obs, legal)
                 next_obs, _, done, _ = env.step(action)
                 ep_obs.append(obs)
-                ep_acts.append(action)
+                ep_acts.append(action)   # poker action 0-7
                 ep_logps.append(logp)
                 ep_vals.append(value)
-                if done:
-                    ep_rews.append(float(env.state.get_reward(0)))
-                else:
-                    ep_rews.append(0.0)
+                ep_rews.append(float(env.state.get_reward(0)) if done else 0.0)
             else:
-                # player 1 用隨機對手（讓 meta 對抗多樣化對手）
                 action = legal[np.random.randint(len(legal))]
                 next_obs, _, done, _ = env.step(action)
                 if done and ep_obs:
-                    # 局末補上 meta 那一側的最終 reward
                     ep_rews[-1] = float(env.state.get_reward(0))
-
             obs = next_obs
             total_steps += 1
 
         if len(ep_obs) > 1:
-            ppo_meta_update(meta, ep_obs, ep_acts, ep_logps, ep_rews, ep_vals)
+            ppo_meta_update(meta, sub_agents, expert_names,
+                            ep_obs, ep_acts, ep_logps, ep_rews, ep_vals)
 
-        pbar.update(total_steps - pbar.n if total_steps - pbar.n > 0 else 0)
-
+        pbar.update(total_steps - pbar.n if total_steps > pbar.n else 0)
         if total_steps % 20000 == 0:
             meta.save(os.path.join(save_dir, f"meta_{total_steps}.pt"))
 
