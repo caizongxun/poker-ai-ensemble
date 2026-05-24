@@ -27,14 +27,22 @@ def load_sub_agents(checkpoint_dir, obs_size, action_size):
         path = os.path.join(checkpoint_dir, f"{name}_final.pt")
         if os.path.exists(path):
             agent.load(path)
+            print(f"  Loaded {name}")
+        else:
+            print(f"  WARNING: {path} not found")
     return agents
 
 
 def pretrain_gating(meta, battle_data_path, epochs=5):
-    """從 battle logs 預訓練 gating network。"""
+    """
+    從 battle logs 預訓練 gating network。
+    讓 gating 學習：哪種局面下哪個 expert 贏得比較多。
+    """
     with open(battle_data_path, "rb") as f:
         records = pickle.load(f)
+
     agent_idx = {"aggressive": 0, "conservative": 1, "strategic": 2, "deceptive": 3}
+
     for epoch in range(epochs):
         total_loss = 0
         count = 0
@@ -42,15 +50,22 @@ def pretrain_gating(meta, battle_data_path, epochs=5):
             if not rec["obs"]:
                 continue
             obs_t = torch.FloatTensor(rec["obs"])
-            rews = np.array(rec["rewards"])
-            best_expert = agent_idx.get(
-                rec.get("agent_a" if rews.mean() >= 0 else "agent_b", "aggressive"), 0
-            )
+
+            # 用 rewards_a 判斷 agent_a 是否贏
+            final_rew_a = rec["rewards_a"][-1] if rec["rewards_a"] else 0.0
+            winner_name = rec["agent_a"] if final_rew_a > 0 else rec["agent_b"]
+            best_expert = agent_idx.get(winner_name, 0)
+
             target = torch.zeros(len(obs_t), dtype=torch.long).fill_(best_expert)
             weights = meta.gating(obs_t)
             loss = torch.nn.functional.cross_entropy(weights, target)
+            # 加 entropy regularization 防止 collapse
+            entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
+            total = loss - 0.1 * entropy
+
             meta.optimizer.zero_grad()
-            loss.backward()
+            total.backward()
+            torch.nn.utils.clip_grad_norm_(meta.gating.parameters(), 0.5)
             meta.optimizer.step()
             total_loss += loss.item()
             count += 1
@@ -73,12 +88,16 @@ def ppo_meta_update(meta, obs, actions, old_logps, rewards, values,
     old_logp_t = torch.FloatTensor(old_logps)
     adv_t = returns_t - torch.FloatTensor(values)
     adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+
     weights = meta.gating(obs_t)
+    # entropy regularization
+    entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
     dist = torch.distributions.Categorical(probs=weights)
     new_logp = dist.log_prob(act_t)
     ratio = (new_logp - old_logp_t).exp()
     surr = torch.min(ratio * adv_t, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv_t)
-    loss = -surr.mean()
+    loss = -surr.mean() - 0.05 * entropy
+
     meta.optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(meta.gating.parameters(), 0.5)
@@ -98,29 +117,53 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
     if os.path.exists(battle_data_path):
         print("Pre-training gating network from battle logs...")
         pretrain_gating(meta, battle_data_path, epochs=5)
+    else:
+        print(f"WARNING: battle data not found at {battle_data_path}, skipping pretrain")
+
     print(f"Fine-tuning Meta Agent for {episodes} episodes...")
     total_steps = 0
     pbar = tqdm(total=episodes)
+
     while total_steps < episodes:
         obs = env.reset()
         ep_obs, ep_acts, ep_rews, ep_logps, ep_vals = [], [], [], [], []
         done = False
+
         while not done:
+            current = env.state.current_player
             legal = env.get_legal_actions()
-            action, logp, value, weights = meta.select_action(obs, legal)
-            next_obs, reward, done, _ = env.step(action)
-            ep_obs.append(obs)
-            ep_acts.append(action)
-            ep_rews.append(reward)
-            ep_logps.append(logp)
-            ep_vals.append(value)
+
+            if current == 0:
+                # meta 控制 player 0
+                action, logp, value, weights = meta.select_action(obs, legal)
+                next_obs, _, done, _ = env.step(action)
+                ep_obs.append(obs)
+                ep_acts.append(action)
+                ep_logps.append(logp)
+                ep_vals.append(value)
+                if done:
+                    ep_rews.append(float(env.state.get_reward(0)))
+                else:
+                    ep_rews.append(0.0)
+            else:
+                # player 1 用隨機對手（讓 meta 對抗多樣化對手）
+                action = legal[np.random.randint(len(legal))]
+                next_obs, _, done, _ = env.step(action)
+                if done and ep_obs:
+                    # 局末補上 meta 那一側的最終 reward
+                    ep_rews[-1] = float(env.state.get_reward(0))
+
             obs = next_obs
             total_steps += 1
+
         if len(ep_obs) > 1:
             ppo_meta_update(meta, ep_obs, ep_acts, ep_logps, ep_rews, ep_vals)
-        pbar.update(len(ep_obs))
+
+        pbar.update(total_steps - pbar.n if total_steps - pbar.n > 0 else 0)
+
         if total_steps % 20000 == 0:
             meta.save(os.path.join(save_dir, f"meta_{total_steps}.pt"))
+
     pbar.close()
     meta.save(os.path.join(save_dir, "meta_final.pt"))
     print(f"Meta Agent saved to {save_dir}/meta_final.pt")
