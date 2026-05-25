@@ -23,14 +23,11 @@ SUB_AGENT_CLASSES = {
     "deceptive":    DeceptiveAgent,
 }
 
-# obs 內對手統計的 index（來自 poker_env.py encode_obs）
 _OPP_VPIP = 122
 _OPP_PFR  = 123
 _OPP_AF   = 124
-_OPP_FOLD = 125
-_OPP_WTSD = 126
 
-# 手工訓練用的對手風格 embedding（用於 pretrain 時對決所需）
+# 手工風格 embedding (vpip, pfr, af_norm, fold_to_raise)
 STYLE_EMBEDDINGS = {
     "aggressive":   np.array([0.80, 0.70, 0.85, 0.15], dtype=np.float32),
     "conservative": np.array([0.22, 0.12, 0.12, 0.75], dtype=np.float32),
@@ -57,12 +54,12 @@ def load_sub_agents(checkpoint_dir, obs_size, action_size):
 
 def pretrain_gating(meta, battle_data_path, epochs=10):
     """
-    從 battle logs 預訓練 gating。
-
-    修正：
-    - 每個 step 的 obs 自己已包含對手統計 (obs[122:127])，從中提取 4-dim opp_style
-    - 對手風格（agent_b 型對應 winner）当作預期最佳 expert label
-    - label 类型：winner expert，而不是總贏處
+    修正版 pretrain：
+    1. 只用 obs_a（player 0 的觀測）訓練，不混入 player 1 的 obs
+    2. label = agent_a 的 expert idx（訓練 gating 展現「我自己的風格」）
+       邏輯：當 agent_a 贏時訓練 gating 輸出 agent_a 的 expert weight 高。
+              當 agent_a 輸時，訓練 gating 輸出 agent_b 的 expert weight 高（應該改用 b 的策略）。
+    3. opp_style 用游所 obs_a 本身的對手統計向量提取 + 手工 embedding 混合
     """
     with open(battle_data_path, "rb") as f:
         records = pickle.load(f)
@@ -74,34 +71,37 @@ def pretrain_gating(meta, battle_data_path, epochs=10):
         count      = 0
 
         for rec in records:
-            obs_list = rec.get("obs", [])
+            obs_list = rec.get("obs_a", [])   # 只用 player 0 的 obs
             if not obs_list:
                 continue
 
-            rew_a    = rec["rewards_a"][-1] if rec["rewards_a"] else 0.0
-            winner   = rec["agent_a"] if rew_a > 0 else rec["agent_b"]
-            opponent = rec["agent_b"] if rew_a > 0 else rec["agent_a"]
+            rew_a   = rec["rewards_a"][-1] if rec["rewards_a"] else 0.0
+            agent_a = rec["agent_a"]
+            agent_b = rec["agent_b"]
 
-            best_expert = STYLE_TO_IDX.get(winner, 0)
-            target      = torch.zeros(len(obs_list), dtype=torch.long).fill_(best_expert)
+            # label 邏輯:
+            # agent_a 贏 -> 展現 agent_a 的風格是對的 -> label = agent_a idx
+            # agent_a 輸 -> 應該改用 agent_b 的風格 -> label = agent_b idx
+            best_expert = (STYLE_TO_IDX.get(agent_a, 0) if rew_a > 0
+                           else STYLE_TO_IDX.get(agent_b, 0))
 
-            obs_t = torch.FloatTensor(obs_list)   # [T, obs_size]
+            obs_t  = torch.FloatTensor(obs_list)  # [T, obs_size]
+            T      = len(obs_list)
+            target = torch.zeros(T, dtype=torch.long).fill_(best_expert)
 
-            # 從 obs 直接取對手統計向量，加上手工 style embedding 的對應分量
-            # obs[122:126] = [vpip, pfr, af_norm, fold_cbet]
-            opp_from_obs  = obs_t[:, _OPP_VPIP: _OPP_VPIP + 4].clamp(0, 1)  # [T,4]
-            style_emb     = torch.FloatTensor(
-                STYLE_EMBEDDINGS.get(opponent,
+            # opp_style: 前期用手工 embedding，後期用 obs 內對手統計
+            style_emb    = torch.FloatTensor(
+                STYLE_EMBEDDINGS.get(agent_b,
                     np.array([0.5]*4, dtype=np.float32))
-            ).unsqueeze(0).expand(len(obs_list), -1)                          # [T,4]
-            # 連對手統計做加權平均：前期 obs 統計少用手工，後期用 obs 圖像
-            t_max  = float(len(obs_list))
-            alphas = torch.arange(len(obs_list), dtype=torch.float32).unsqueeze(1) / t_max
-            opp_style = (1 - alphas) * style_emb + alphas * opp_from_obs    # [T,4]
+            ).unsqueeze(0).expand(T, -1)                      # [T,4]
+            opp_from_obs = obs_t[:, _OPP_VPIP:_OPP_VPIP+4].clamp(0, 1)  # [T,4]
+            alphas       = (torch.arange(T, dtype=torch.float32) / T
+                            ).unsqueeze(1)                     # [T,1]
+            opp_style    = (1 - alphas) * style_emb + alphas * opp_from_obs
 
             weights = meta.gating(obs_t, opp_style)
             loss    = torch.nn.functional.cross_entropy(weights, target)
-            entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
+            entropy = -(weights * (weights + 1e-8).log()).sum(-1).mean()
             total   = loss - 0.1 * entropy
 
             meta.optimizer.zero_grad()
@@ -115,9 +115,9 @@ def pretrain_gating(meta, battle_data_path, epochs=10):
               f"loss: {total_loss/max(count,1):.4f}")
 
 
-def ppo_meta_update(meta, sub_agents, expert_names, obs_list,
-                    opp_styles, actions, old_logps, rewards, values,
-                    gamma=0.99, clip_eps=0.2):
+def ppo_meta_update(meta, sub_agents, expert_names,
+                    obs_list, opp_styles, actions, old_logps,
+                    rewards, values, gamma=0.99, clip_eps=0.2):
     n = len(rewards)
     if n < 2:
         return
@@ -136,25 +136,26 @@ def ppo_meta_update(meta, sub_agents, expert_names, obs_list,
     adv_t      = ret_t - torch.FloatTensor(values)
     adv_t      = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
 
-    weights        = meta.gating(obs_t, opp_t)   # [N, 4]
-    gating_entropy = -(weights * (weights + 1e-8).log()).sum(dim=-1).mean()
+    weights        = meta.gating(obs_t, opp_t)
+    gating_entropy = -(weights * (weights + 1e-8).log()).sum(-1).mean()
 
     all_expert_probs = []
     for name in expert_names:
-        agent      = sub_agents[name]
-        probs_list = [agent.get_action_probs(ob, list(range(meta.action_size)))
-                      for ob in obs_list]
-        all_expert_probs.append(torch.FloatTensor(np.array(probs_list)))  # [N,8]
-    expert_stack = torch.stack(all_expert_probs, dim=1)  # [N,4,8]
-    mixed_probs  = (weights.unsqueeze(2) * expert_stack).sum(1)           # [N,8]
+        probs_list = [
+            sub_agents[name].get_action_probs(ob, list(range(meta.action_size)))
+            for ob in obs_list
+        ]
+        all_expert_probs.append(torch.FloatTensor(np.array(probs_list)))
+    expert_stack = torch.stack(all_expert_probs, dim=1)   # [N,4,8]
+    mixed_probs  = (weights.unsqueeze(2) * expert_stack).sum(1)  # [N,8]
     mixed_probs  = mixed_probs.clamp(min=1e-8)
-    mixed_probs  = mixed_probs / mixed_probs.sum(dim=-1, keepdim=True)
+    mixed_probs  = mixed_probs / mixed_probs.sum(-1, keepdim=True)
 
     dist     = torch.distributions.Categorical(probs=mixed_probs)
     new_logp = dist.log_prob(act_t)
     ratio    = (new_logp - old_logp_t).exp()
     surr     = torch.min(ratio * adv_t,
-                         ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv_t)
+                         ratio.clamp(1-clip_eps, 1+clip_eps) * adv_t)
     loss     = -surr.mean() - 0.05 * gating_entropy
 
     meta.optimizer.zero_grad()
@@ -207,7 +208,6 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
 
             if current == 0:
                 action, logp, value, _ = meta.select_action(obs, legal)
-                next_obs, _, done, _   = env.step(action)
                 ep_obs.append(obs)
                 ep_opp.append(meta.opp_tracker.get_embedding())
                 ep_acts.append(action)
@@ -218,12 +218,12 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
             else:
                 opp_action, _, _ = opp_agent.select_action(obs, legal)
                 street      = getattr(env.state, "street", 0)
-                faced_raise = (opp_action >= 2)
-                meta.observe_opponent(opp_action, street, faced_raise)
-                next_obs, _, done, _ = env.step(opp_action)
-                if done and ep_obs:
-                    ep_rews[-1] = float(env.state.get_reward(0))
-
+                meta.observe_opponent(opp_action, street,
+                                      faced_raise=(opp_action >= 2))
+            next_obs, _, done, _ = env.step(
+                action if current == 0 else opp_action)
+            if done and ep_obs:
+                ep_rews[-1] = float(env.state.get_reward(0))
             obs          = next_obs
             total_steps += 1
 

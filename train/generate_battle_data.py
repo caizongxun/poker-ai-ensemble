@@ -16,10 +16,10 @@ from agents.deceptive_agent import DeceptiveAgent
 
 def load_agents(checkpoint_dir, obs_size, action_size):
     agents = {
-        "aggressive": AggressiveAgent(obs_size, action_size),
+        "aggressive":   AggressiveAgent(obs_size, action_size),
         "conservative": ConservativeAgent(obs_size, action_size),
-        "strategic": StrategicAgent(obs_size, action_size),
-        "deceptive": DeceptiveAgent(obs_size, action_size),
+        "strategic":    StrategicAgent(obs_size, action_size),
+        "deceptive":    DeceptiveAgent(obs_size, action_size),
     }
     for name, agent in agents.items():
         path = os.path.join(checkpoint_dir, f"{name}_final.pt")
@@ -33,34 +33,40 @@ def load_agents(checkpoint_dir, obs_size, action_size):
 
 def run_battle(env, agent_a, agent_b, episodes=1000):
     """
-    agent_a = player 0, agent_b = player 1。
-    根據 env.state.current_player 路由行動。
+    agent_a = player 0, agent_b = player 1.
+
+    修正：分開儲存 player 0 和 player 1 的 obs。
+    obs_a: 只包含 player 0 行動時的觀測值
+    obs_b: 只包含 player 1 行動時的觀測值
+    這樣 pretrain 才能正確地用 player 0 的 obs 訓練 gating。
     """
     records = []
     for _ in range(episodes):
         obs = env.reset()
-        episode = {"obs": [], "actions": [], "rewards_a": [], "rewards_b": [],
-                   "current_players": []}
+        episode = {
+            "obs_a": [],        # player 0 行動時的 obs
+            "obs_b": [],        # player 1 行動時的 obs
+            "actions_a": [],    # player 0 的 actions
+            "actions_b": [],    # player 1 的 actions
+            "rewards_a": [],
+            "rewards_b": [],
+        }
         done = False
-        last_player = 0
         while not done:
             current = env.state.current_player
-            legal = env.get_legal_actions()
+            legal   = env.get_legal_actions()
             if current == 0:
                 action, _, _ = agent_a.select_action(obs, legal)
+                episode["obs_a"].append(obs.tolist())
+                episode["actions_a"].append(action)
             else:
                 action, _, _ = agent_b.select_action(obs, legal)
-            last_player = current
-            next_obs, reward, done, _ = env.step(action)
-            episode["obs"].append(obs.tolist())
-            episode["actions"].append(action)
-            episode["current_players"].append(current)
+                episode["obs_b"].append(obs.tolist())
+                episode["actions_b"].append(action)
+            next_obs, _, done, _ = env.step(action)
             if done:
                 episode["rewards_a"].append(float(env.state.get_reward(0)))
                 episode["rewards_b"].append(float(env.state.get_reward(1)))
-            else:
-                episode["rewards_a"].append(0.0)
-                episode["rewards_b"].append(0.0)
             obs = next_obs
         records.append(episode)
     return records
@@ -68,21 +74,23 @@ def run_battle(env, agent_a, agent_b, episodes=1000):
 
 def generate(checkpoint_dir, output_path, episodes_per_pair):
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-    env = PokerEnv(num_players=2)
+    env    = PokerEnv(num_players=2)
     agents = load_agents(checkpoint_dir, env.observation_size, env.action_size)
-    names = list(agents.keys())
+    names  = list(agents.keys())
     all_records = []
-    # 包含 self-play (a vs a) 和 cross-play (a vs b)
+
+    # 包含 self-play 和 cross-play
     pairs = [(a, b) for i, a in enumerate(names) for b in names[i:]]
     for a_name, b_name in tqdm(pairs, desc="Battle pairs"):
-        records = run_battle(env, agents[a_name], agents[b_name], episodes_per_pair)
+        records = run_battle(
+            env, agents[a_name], agents[b_name], episodes_per_pair)
         for r in records:
             r["agent_a"] = a_name
             r["agent_b"] = b_name
         all_records.extend(records)
-        # 简單統計輸出
-        wins_a = sum(1 for r in records if r["rewards_a"][-1] > 0)
+        wins_a = sum(1 for r in records if r["rewards_a"] and r["rewards_a"][-1] > 0)
         print(f"  {a_name} vs {b_name}: {wins_a}/{len(records)} wins for {a_name}")
+
     with open(output_path, "wb") as f:
         pickle.dump(all_records, f)
     print(f"\nSaved {len(all_records)} battle records to {output_path}")
@@ -90,8 +98,8 @@ def generate(checkpoint_dir, output_path, episodes_per_pair):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint-dir", default="checkpoints")
-    parser.add_argument("--output", default="data/battle_logs.pkl")
-    parser.add_argument("--episodes-per-pair", type=int, default=5000)
+    parser.add_argument("--checkpoint-dir",      default="checkpoints")
+    parser.add_argument("--output",              default="data/battle_logs.pkl")
+    parser.add_argument("--episodes-per-pair",   type=int, default=5000)
     args = parser.parse_args()
     generate(args.checkpoint_dir, args.output, args.episodes_per_pair)
