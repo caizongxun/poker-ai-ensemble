@@ -23,10 +23,9 @@ AGENT_MAP = {
 
 
 def load_opponent(name, obs_size, action_size, checkpoint_dir):
-    """載入已訓練的對手 agent，如果 checkpoint 不存在就用隨機權重。"""
     if name not in AGENT_MAP:
         return None
-    opp = AGENT_MAP[name](obs_size, action_size)
+    opp  = AGENT_MAP[name](obs_size, action_size)
     path = os.path.join(checkpoint_dir, f"{name}_final.pt")
     if os.path.exists(path):
         opp.load(path)
@@ -38,9 +37,8 @@ def load_opponent(name, obs_size, action_size, checkpoint_dir):
 
 def collect_rollout(env, agent, opponent, num_steps=2048, agent_seat=None):
     """
-    對戰式 rollout: agent 對戰 opponent。
-    如果 opponent=None，則用 self-play。
-    agent_seat=None 表示每局隨機指定座位。
+    修正：將 step_action 與 current 綁定在同一個 if/else 內部。
+    不再後期用 (action if current==0 else opp_action) 的对據式。
     """
     obs_buf, act_buf, rew_buf, logp_buf, val_buf, done_buf = \
         [], [], [], [], [], []
@@ -54,16 +52,7 @@ def collect_rollout(env, agent, opponent, num_steps=2048, agent_seat=None):
 
         if current == seat:
             action, logp, value = agent.select_action(obs, legal)
-        else:
-            if opponent is not None:
-                action, _, _ = opponent.select_action(obs, legal)
-            else:
-                # self-play
-                action, logp_tmp, val_tmp = agent.select_action(obs, legal)
-
-        next_obs, _, done, _ = env.step(action)
-
-        if current == seat:
+            next_obs, _, done, _ = env.step(action)
             obs_buf.append(obs)
             act_buf.append(action)
             logp_buf.append(logp)
@@ -77,6 +66,13 @@ def collect_rollout(env, agent, opponent, num_steps=2048, agent_seat=None):
                 rew_buf.append(0.0)
                 done_buf.append(False)
             step += 1
+        else:
+            # 對手座位：用 opponent 或 self-play
+            if opponent is not None:
+                opp_action, _, _ = opponent.select_action(obs, legal)
+            else:
+                opp_action, _, _ = agent.select_action(obs, legal)
+            next_obs, _, done, _ = env.step(opp_action)
 
         if done:
             obs  = env.reset()
@@ -99,8 +95,8 @@ def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
     advantages = np.zeros(n, dtype=np.float32)
     last_gae   = 0.0
     for t in reversed(range(n)):
-        next_val    = 0.0 if dones[t] else (values[t + 1] if t + 1 < n else 0.0)
-        delta       = rewards[t] + gamma * next_val - values[t]
+        next_val      = 0.0 if dones[t] else (values[t + 1] if t + 1 < n else 0.0)
+        delta         = rewards[t] + gamma * next_val - values[t]
         advantages[t] = last_gae = delta + gamma * lam * (0 if dones[t] else last_gae)
     return advantages, advantages + values
 
@@ -135,16 +131,11 @@ def ppo_update(agent, obs, actions, old_logps, advantages, returns,
 
 def train(agent_name, episodes, save_dir, checkpoint_dir,
           opponent_names=None, opponent_ratio=0.5):
-    """
-    opponent_names: 要對戰的對手名稱列表。None = 純 self-play。
-    opponent_ratio: 對戰局占總局數的比例 (0~1)。
-    """
     os.makedirs(save_dir, exist_ok=True)
     env        = PokerEnv(num_players=2)
     AgentClass = AGENT_MAP[agent_name]
     agent      = AgentClass(env.observation_size, env.action_size)
 
-    # 載入對手列表
     opponents = []
     if opponent_names:
         for oname in opponent_names:
@@ -161,12 +152,11 @@ def train(agent_name, episodes, save_dir, checkpoint_dir,
     pbar        = tqdm(total=episodes)
 
     while total_steps < episodes:
-        # 按 ratio 決定本次用對戰還是 self-play
         if opponents and random.random() < opponent_ratio:
             opp = opponents[opp_idx % len(opponents)]
             opp_idx += 1
         else:
-            opp = None  # self-play
+            opp = None
 
         obs, acts, rews, logps, vals, dones = \
             collect_rollout(env, agent, opp)
@@ -192,7 +182,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--opponents", nargs="*", default=None,
         help="對戰的對手名稱，可多個。不指定則純 self-play。"
-             "e.g. --opponents aggressive deceptive"
     )
     parser.add_argument(
         "--opponent-ratio", type=float, default=0.6,

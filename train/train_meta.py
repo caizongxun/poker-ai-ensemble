@@ -27,7 +27,6 @@ _OPP_VPIP = 122
 _OPP_PFR  = 123
 _OPP_AF   = 124
 
-# 手工風格 embedding (vpip, pfr, af_norm, fold_to_raise)
 STYLE_EMBEDDINGS = {
     "aggressive":   np.array([0.80, 0.70, 0.85, 0.15], dtype=np.float32),
     "conservative": np.array([0.22, 0.12, 0.12, 0.75], dtype=np.float32),
@@ -53,14 +52,6 @@ def load_sub_agents(checkpoint_dir, obs_size, action_size):
 
 
 def pretrain_gating(meta, battle_data_path, epochs=10):
-    """
-    修正版 pretrain：
-    1. 只用 obs_a（player 0 的觀測）訓練，不混入 player 1 的 obs
-    2. label = agent_a 的 expert idx（訓練 gating 展現「我自己的風格」）
-       邏輯：當 agent_a 贏時訓練 gating 輸出 agent_a 的 expert weight 高。
-              當 agent_a 輸時，訓練 gating 輸出 agent_b 的 expert weight 高（應該改用 b 的策略）。
-    3. opp_style 用游所 obs_a 本身的對手統計向量提取 + 手工 embedding 混合
-    """
     with open(battle_data_path, "rb") as f:
         records = pickle.load(f)
     print(f"Pretraining from {len(records)} battle records...")
@@ -71,32 +62,25 @@ def pretrain_gating(meta, battle_data_path, epochs=10):
         count      = 0
 
         for rec in records:
-            obs_list = rec.get("obs_a", [])   # 只用 player 0 的 obs
+            obs_list = rec.get("obs_a", [])
             if not obs_list:
                 continue
 
             rew_a   = rec["rewards_a"][-1] if rec["rewards_a"] else 0.0
             agent_a = rec["agent_a"]
             agent_b = rec["agent_b"]
-
-            # label 邏輯:
-            # agent_a 贏 -> 展現 agent_a 的風格是對的 -> label = agent_a idx
-            # agent_a 輸 -> 應該改用 agent_b 的風格 -> label = agent_b idx
             best_expert = (STYLE_TO_IDX.get(agent_a, 0) if rew_a > 0
                            else STYLE_TO_IDX.get(agent_b, 0))
 
-            obs_t  = torch.FloatTensor(obs_list)  # [T, obs_size]
+            obs_t  = torch.FloatTensor(obs_list)
             T      = len(obs_list)
             target = torch.zeros(T, dtype=torch.long).fill_(best_expert)
 
-            # opp_style: 前期用手工 embedding，後期用 obs 內對手統計
             style_emb    = torch.FloatTensor(
-                STYLE_EMBEDDINGS.get(agent_b,
-                    np.array([0.5]*4, dtype=np.float32))
-            ).unsqueeze(0).expand(T, -1)                      # [T,4]
-            opp_from_obs = obs_t[:, _OPP_VPIP:_OPP_VPIP+4].clamp(0, 1)  # [T,4]
-            alphas       = (torch.arange(T, dtype=torch.float32) / T
-                            ).unsqueeze(1)                     # [T,1]
+                STYLE_EMBEDDINGS.get(agent_b, np.array([0.5]*4, dtype=np.float32))
+            ).unsqueeze(0).expand(T, -1)
+            opp_from_obs = obs_t[:, _OPP_VPIP:_OPP_VPIP+4].clamp(0, 1)
+            alphas       = (torch.arange(T, dtype=torch.float32) / T).unsqueeze(1)
             opp_style    = (1 - alphas) * style_emb + alphas * opp_from_obs
 
             weights = meta.gating(obs_t, opp_style)
@@ -146,8 +130,8 @@ def ppo_meta_update(meta, sub_agents, expert_names,
             for ob in obs_list
         ]
         all_expert_probs.append(torch.FloatTensor(np.array(probs_list)))
-    expert_stack = torch.stack(all_expert_probs, dim=1)   # [N,4,8]
-    mixed_probs  = (weights.unsqueeze(2) * expert_stack).sum(1)  # [N,8]
+    expert_stack = torch.stack(all_expert_probs, dim=1)
+    mixed_probs  = (weights.unsqueeze(2) * expert_stack).sum(1)
     mixed_probs  = mixed_probs.clamp(min=1e-8)
     mixed_probs  = mixed_probs / mixed_probs.sum(-1, keepdim=True)
 
@@ -202,28 +186,30 @@ def train_meta(checkpoint_dir, battle_data_path, episodes, save_dir):
         ep_obs, ep_opp, ep_acts, ep_rews, ep_logps, ep_vals = \
             [], [], [], [], [], []
 
+        # 修正：將 action / opp_action 分開宣告，不再共用變數
         while not done:
             current = env.state.current_player
             legal   = env.get_legal_actions()
 
             if current == 0:
                 action, logp, value, _ = meta.select_action(obs, legal)
+                next_obs, _, done, _ = env.step(action)
                 ep_obs.append(obs)
                 ep_opp.append(meta.opp_tracker.get_embedding())
                 ep_acts.append(action)
                 ep_logps.append(logp)
                 ep_vals.append(value)
-                ep_rews.append(
-                    float(env.state.get_reward(0)) if done else 0.0)
+                ep_rews.append(0.0)  # 整局結束時再回填
             else:
                 opp_action, _, _ = opp_agent.select_action(obs, legal)
-                street      = getattr(env.state, "street", 0)
+                street = getattr(env.state, "street", 0)
                 meta.observe_opponent(opp_action, street,
                                       faced_raise=(opp_action >= 2))
-            next_obs, _, done, _ = env.step(
-                action if current == 0 else opp_action)
+                next_obs, _, done, _ = env.step(opp_action)
+
             if done and ep_obs:
                 ep_rews[-1] = float(env.state.get_reward(0))
+
             obs          = next_obs
             total_steps += 1
 
